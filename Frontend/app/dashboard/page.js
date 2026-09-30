@@ -256,16 +256,31 @@ const mark = async () => {
 
     setStatus("Sending live face to Presence backend...");
 
-    const response = await api("/api/checkin", {
-      method: "POST",
-      body: JSON.stringify({
-        roll_no: student.roll_no,
-        room_code: room.toUpperCase(),
-        session_id: session.id,
-        qr_token: qrToken,
-        image: image,
-      }),
-    });
+    // Get the latest QR token before submitting attendance
+const qrResponse = await api(
+  `/api/session/${session.id}/qr`
+);
+
+const currentQrToken = qrResponse.data.token;
+
+if (!currentQrToken) {
+  throw new Error("Unable to get the current QR token. Please scan the QR again.");
+}
+
+// Update frontend state with the latest token
+setQrToken(currentQrToken);
+
+// Send face image + latest QR token to backend
+const response = await api("/api/checkin", {
+  method: "POST",
+  body: JSON.stringify({
+    roll_no: student.roll_no,
+    room_code: room.toUpperCase(),
+    session_id: session.id,
+    qr_token: currentQrToken,
+    image: image,
+  }),
+});
 
     const distance = Number(response?.data?.distance);
 

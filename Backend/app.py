@@ -9,15 +9,15 @@ import os
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
 
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from werkzeug.security import check_password_hash
 from apscheduler.schedulers.background import BackgroundScheduler
 from openpyxl import Workbook
-import qrcode
 from openpyxl.styles import Font, Alignment
+from openpyxl.utils import get_column_letter
+import qrcode
 
 from config import config
 from face_pipeline import decode_base64_image, get_face_embedding, compare_embeddings
@@ -43,14 +43,16 @@ from supabase_client import (
     get_attendance_for_student,
     get_students_by_class,
     get_class_attendance_stats,
+    get_session_by_id,
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = config.MAX_CONTENT_LENGTH
-CORS(app, resources={r"/api/*": {"origins": config.CORS_ORIGINS.split(",") if config.CORS_ORIGINS != "*" else "*"}})
+app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
+cors_origins = config.CORS_ORIGINS.split(",") if config.CORS_ORIGINS and config.CORS_ORIGINS != "*" else "*"
+CORS(app, resources={r"/api/*": {"origins": cors_origins}})
 
 ROOM_TTL = 120
 QR_TTL = 30
@@ -91,7 +93,6 @@ def now_utc():
 
 
 def qr_secret():
-    # Never expose this secret to the browser.
     return config.FLASK_SECRET_KEY
 
 
@@ -211,7 +212,6 @@ def register_face():
         if not student:
             student = create_student(name=name, email=email, roll_no=roll_no)
         else:
-            # Keep existing identity but fill in current details where permitted.
             if student.get("name") != name or student.get("email") != email:
                 from supabase_client import update_student_identity
                 update_student_identity(student["id"], name, email, roll_no)
@@ -237,7 +237,7 @@ def register_face():
         return error("Face registration failed.", 500, str(exc))
 
 
-# ---------------- teacher login ----------------
+# ---------------- teacher/student authentication ----------------
 @app.post("/api/student/login")
 def student_login():
     try:
@@ -259,6 +259,7 @@ def student_login():
         logger.exception("Student login failed")
         return error("Student login failed.", 500, str(exc))
 
+
 @app.get("/api/room/<room_code>")
 def room_lookup(room_code):
     session = validate_room_code(clean_string(room_code).upper())
@@ -269,6 +270,7 @@ def room_lookup(room_code):
         "subject": session.get("subject", ""), "period_start": session.get("period_start", ""),
         "period_end": session.get("period_end", ""), "expires_at": session.get("expires_at"), "status": session.get("status")
     })
+
 
 @app.post("/api/teacher/login")
 def teacher_login():
@@ -406,13 +408,20 @@ def checkin():
         session_id = clean_string(data.get("session_id"))
         image = data.get("image")
 
-        if not all([roll_no, room_code, qr_token, session_id, image]):
-            return error("Room Code, QR scan, Roll Number and live face capture are required.")
+        missing = []
+        if not roll_no: missing.append("roll_no")
+        if not room_code: missing.append("room_code")
+        if not qr_token: missing.append("qr_token")
+        if not session_id: missing.append("session_id")
+        if not image: missing.append("image")
+
+        if missing:
+            return error(f"Missing required fields: {', '.join(missing)}", 400)
 
         session = validate_room_code(room_code)
         if not session:
             return error("Room code is invalid or expired.", 401)
-        if str(session["id"]) != session_id:
+        if str(session["id"]) != str(session_id):
             return error("The scanned QR does not belong to this room.", 401)
         if not validate_qr_token(session_id, qr_token):
             return error("QR code is invalid or has expired. Scan the current QR again.", 401)
@@ -430,7 +439,7 @@ def checkin():
             live_image = decode_base64_image(image)
             live_embedding = get_face_embedding(live_image)
         except (ValueError, binascii.Error) as exc:
-            return error(str(exc))
+            return error(f"Invalid face image format: {str(exc)}", 400)
 
         result = compare_embeddings(stored, live_embedding)
         if not result["match"]:
@@ -441,13 +450,19 @@ def checkin():
             })
 
         record = create_attendance_record(
-            session_id=session["id"], student_id=student["id"],
-            match_distance=result["distance"], status="present", method="qr+face"
+            session_id=session["id"],
+            student_id=student["id"],
+            match_distance=result["distance"],
+            status="present",
+            method="qr+face"
         )
         return success("Attendance marked successfully!", {
-            "record_id": record["id"], "session_id": session["id"],
-            "roll_no": student["roll_no"], "status": "present",
-            "distance": result["distance"], "threshold": result["threshold"],
+            "record_id": record["id"],
+            "session_id": session["id"],
+            "roll_no": student["roll_no"],
+            "status": "present",
+            "distance": result["distance"],
+            "threshold": result["threshold"],
         })
     except Exception as exc:
         logger.exception("Check-in failed")
@@ -455,6 +470,10 @@ def checkin():
 
 
 # ---------------- session/report ----------------
+def get_session_any(session_id):
+    return get_session_by_id(session_id)
+
+
 def build_attendance_workbook(session_id):
     session = get_active_session(session_id) or get_session_any(session_id)
     if not session:
@@ -510,7 +529,7 @@ def build_attendance_workbook(session_id):
 
     widths = [8, 18, 26, 34, 14, 28]
     for i, width in enumerate(widths, 1):
-        ws.column_dimensions[chr(64 + i)].width = width
+        ws.column_dimensions[get_column_letter(i)].width = width
 
     output = io.BytesIO()
     wb.save(output)
@@ -530,11 +549,6 @@ def save_attendance_report(session_id):
     with open(path, "wb") as f:
         f.write(workbook.getvalue())
     return path
-
-
-def get_session_any(session_id):
-    from supabase_client import get_session_by_id
-    return get_session_by_id(session_id)
 
 
 @app.post("/api/close-session")
